@@ -152,79 +152,6 @@ static int file_exists (const char * file) {
 	}
 }
 
-int daemond_pid_lock(daemond_pid * pid) {
-	struct stat sb;
-	int r,err;
-	pid_t oldpid;
-	FILE *f;
-	daemond_say(pid->d, "lock %s", pid->pidfile);
-	if( stat(pid->pidfile, &sb) == -1 ) {
-		err = errno;
-		ewarn("no pid");
-		switch(err) {
-			case ENOENT:
-				r = daemond_pid_openlocked( pid, 0 );
-				break;
-			default:
-				warn("shit!");
-		}
-	} else {
-		//debug("have pid");
-		f = fopen(pid->pidfile,"r");
-		if (!f) {
-			die("Can't open old pidfile `%s' for reading: %s",pid->pidfile, ERR);
-		}
-		if( fscanf(f,"%d",&oldpid) > 0 ) {
-			//debug("got old pid: %d",oldpid);
-			if( kill(oldpid,0) == 0 ) {
-				//warn("old process %d still alive",oldpid);
-				pid->oldpid = oldpid;
-				return 0;
-			}
-		}
-		r = daemond_pid_openlocked( pid, 0 );
-	}
-	if (pid->locked) {
-		if (pid->verbose)
-			//debug( "pidfile `%s' was locked", pid->pidfile );
-		if( flock(pid->fd, LOCK_EX|LOCK_NB) == -1) {
-			die("Relock pidfile `%s' failed: %s",pid->pidfile, strerror(errno));
-		}
-		daemond_pid_write(pid);
-		return 1;
-	}
-	return 0;
-}
-
-void daemond_pid_forget(daemond_pid * pid) {
-	pid->owner = 0;
-}
-
-void daemond_pid_close(daemond_pid * pid) {
-	if (pid->handle) {
-		fclose(pid->handle);
-	}
-	close(pid->fd);
-	bzero(pid,sizeof(daemond_pid));
-}
-
-void daemond_pid_write(daemond_pid * pid) {
-	if (! pid->handle )
-		die("Can't write to unopened pidfile");
-	if (! pid->locked)
-		die("Mustn't write to not locked pidfile");
-	if ( pid->owner != getpid() )
-		die("Write to pidfile allowed only to owner(%d), tried by %d", pid->owner, getpid());
-	if( fseek(pid->handle,0,SEEK_SET) == -1 )
-		die("Can't seek handle: %s",strerror(errno));
-	if( fprintf( pid->handle, "%u\n", getpid() ) == -1)
-		die("Failed to write pidfile: %s",strerror(errno));
-	if( fflush(pid->handle) == 1 )
-		die("Failed to flush pidfile: %s",ERR);
-	if ( fsync( pid->fd ) == -1 )
-		die("Failed to sync pid after write: %s",ERR);
-}
-
 static int daemond_pid_openlocked( daemond_pid * pid, int recurse ) {
 	int r,err;
 	int created;
@@ -324,6 +251,80 @@ static int daemond_pid_openlocked( daemond_pid * pid, int recurse ) {
 	return r;
 }
 
+int daemond_pid_lock(daemond_pid * pid) {
+	struct stat sb;
+	int r,err;
+	pid_t oldpid;
+	FILE *f;
+	daemond_say(pid->d, "lock %s", pid->pidfile);
+	if( stat(pid->pidfile, &sb) == -1 ) {
+		err = errno;
+		ewarn("no pid");
+		switch(err) {
+			case ENOENT:
+				r = daemond_pid_openlocked( pid, 0 );
+				break;
+			default:
+				warn("shit!");
+		}
+	} else {
+		//debug("have pid");
+		f = fopen(pid->pidfile,"r");
+		if (!f) {
+			die("Can't open old pidfile `%s' for reading: %s",pid->pidfile, ERR);
+		}
+		if( fscanf(f,"%d",&oldpid) > 0 ) {
+			//debug("got old pid: %d",oldpid);
+			if( kill(oldpid,0) == 0 ) {
+				//warn("old process %d still alive",oldpid);
+				pid->oldpid = oldpid;
+				return 0;
+			}
+		}
+		r = daemond_pid_openlocked( pid, 0 );
+	}
+	if (pid->locked) {
+		if (pid->verbose)
+			//debug( "pidfile `%s' was locked", pid->pidfile );
+		if( flock(pid->fd, LOCK_EX|LOCK_NB) == -1) {
+			die("Relock pidfile `%s' failed: %s",pid->pidfile, strerror(errno));
+		}
+		daemond_pid_write(pid);
+		return 1;
+	}
+	return 0;
+}
+
+void daemond_pid_forget(daemond_pid * pid) {
+	pid->owner = 0;
+}
+
+void daemond_pid_close(daemond_pid * pid) {
+	if (pid->handle) {
+		fclose(pid->handle);
+	}
+	close(pid->fd);
+	bzero(pid,sizeof(daemond_pid));
+}
+
+void daemond_pid_write(daemond_pid * pid) {
+	if (! pid->handle )
+		die("Can't write to unopened pidfile");
+	if (! pid->locked)
+		die("Mustn't write to not locked pidfile");
+	if ( pid->owner != getpid() )
+		die("Write to pidfile allowed only to owner(%d), tried by %d", pid->owner, getpid());
+	if( fseek(pid->handle,0,SEEK_SET) == -1 )
+		die("Can't seek handle: %s",strerror(errno));
+	if( fprintf( pid->handle, "%u\n", getpid() ) == -1)
+		die("Failed to write pidfile: %s",strerror(errno));
+	if( fflush(pid->handle) == 1 )
+		die("Failed to flush pidfile: %s",ERR);
+	if ( fsync( pid->fd ) == -1 )
+		die("Failed to sync pid after write: %s",ERR);
+}
+
+
 void daemond_pid_relock(daemond_pid * pid) {
 	if (pid->locked) {
 		if( flock(pid->fd,LOCK_EX|LOCK_NB) == -1)
@@ -336,6 +337,13 @@ void daemond_pid_relock(daemond_pid * pid) {
 /*
  * Cli functions
  */
+
+static double htime() {
+	struct timeval tp;
+	gettimeofday(&tp,NULL);
+	return ((double)tp.tv_usec / 1000000) + ((double)tp.tv_sec);
+}
+
 
 static int kill_ext(int pidgrp, int sig) {
 	pid_t pid;
