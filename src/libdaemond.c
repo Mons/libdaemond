@@ -769,11 +769,24 @@ void daemond_daemonize(daemond * d) {
 		die("dup2(stdout) failed: %s",ERR);
 	}
 	
+	if (dup2(fd, STDERR_FILENO) == -1) {
+		die("dup2(stderr) failed: %s",ERR);
+	}
+	
 	if (fd > STDERR_FILENO) {
 		if (close(fd) == -1) {
-			warn("close() failed: %s", ERR);
+			warn("close(%d) failed: %s", fd, ERR);
 		}
 	}
+	
+	/*
+	fclose(stdout);
+	stdout = fdopen( STDOUT_FILENO, "w" );
+	fclose(stderr);
+	stderr = fdopen( STDERR_FILENO, "w" );
+	fclose(stdin);
+	stdin = fdopen( STDIN_FILENO, "r" );
+	*/
 }
 
 /*
@@ -1082,6 +1095,8 @@ void daemond_master(daemond * d) {
 	d->children = children;
 	d->children_running = 0;
 	d->fork_at  = htime();
+	
+	d->force_quit       = 1;
 	
 	daemond_sig_init(d);
 	
