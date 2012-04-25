@@ -17,6 +17,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <signal.h>
+//#include <sys/signal.h>
+#include <sys/wait.h>
 
 #include <sys/wait.h>
 
@@ -137,6 +139,22 @@ int daemond_say(daemond * d, const char * fmt, ...) {
 	va_end(va_args);
 	
 	colorprintf("</>%s", *p == '\n' ? "" : "\n");
+}
+
+int daemond_printf(daemond * d, const char * fmt, ...) {
+	va_list va_args;
+	char * p = (char *)fmt;
+	p += strlen(fmt)-1;
+	
+	if (d) {
+		colorprintf("<g>%s</> - ", d->name);
+	}
+	
+	va_start(va_args,fmt);
+	vcolorprintf(fmt, va_args);
+	va_end(va_args);
+	
+	colorprintf("</>");
 }
 
 /*
@@ -279,12 +297,16 @@ int daemond_pid_lock(daemond_pid * pid) {
 				//warn("old process %d still alive",oldpid);
 				pid->oldpid = oldpid;
 				return 0;
+			} else {
+				//daemond_say(pid->d, "<y>stalled pidfile old pid %d is invalid", oldpid);
 			}
+		} else {
+			daemond_say(pid->d, "<r>can't read pidfile contents");
 		}
 		r = daemond_pid_openlocked( pid, 0 );
 	}
 	if (pid->locked) {
-		if (pid->verbose)
+		//if (pid->verbose)
 			//debug( "pidfile `%s' was locked", pid->pidfile );
 		if( flock(pid->fd, LOCK_EX|LOCK_NB) == -1) {
 			die("Relock pidfile `%s' failed: %s",pid->pidfile, strerror(errno));
@@ -322,6 +344,26 @@ void daemond_pid_write(daemond_pid * pid) {
 		die("Failed to flush pidfile: %s",ERR);
 	if ( fsync( pid->fd ) == -1 )
 		die("Failed to sync pid after write: %s",ERR);
+}
+
+pid_t daemond_pid_read(daemond_pid * pid) {
+	pid_t new;
+	if (! pid->handle )
+		die("Can't read unopened pidfile");
+	
+	if ( fsync( pid->fd ) == -1 )
+		die("Failed to sync pid before read: %s",ERR);
+	
+	if( fseek(pid->handle,0,SEEK_SET) == -1 )
+		die("Can't seek handle: %s",strerror(errno));
+	
+	if ( fscanf( pid->handle, "%d", &new ) != 1 )
+		die("Can't read pidfile: %s", strerror(errno));
+	
+	if( fseek(pid->handle,0,SEEK_SET) == -1 )
+		die("Can't rewind handle: %s",strerror(errno));
+	
+	return new;
 }
 
 
@@ -430,8 +472,10 @@ void daemond_cli_usage(daemond_cli * cli) {
 
 void daemond_cli_run(daemond_cli * cli, int argc, char *argv[]) {
 	//debug("name = %s",cli->d->name);
-	//if (!cli->d->pid)
-	//	die("Pid required for CLI");
+	if (!cli->d->use_pid) {
+		daemond_say(cli->d,"<r>use_pid required for CLI");
+		exit(255);
+	}
 	daemond_pid * pid = &cli->d->pid;
 	pid_t oldpid, killed;
 	char * command;
@@ -465,7 +509,7 @@ void daemond_cli_run(daemond_cli * cli, int argc, char *argv[]) {
 	if( daemond_pid_lock(pid) ) {
 		//debug("pid locked by cli");
 	} else {
-		//debug("pid not locked");
+		//debug("pid not locked (old=%d)", pid->oldpid);
 		if (oldpid = pid->oldpid) {
 			//debug("have old pid: %d",pid->oldpid);
 			switch(com) {
@@ -517,15 +561,22 @@ void daemond_cli_run(daemond_cli * cli, int argc, char *argv[]) {
  * SIG functions
  */
 
+
 /*
-sig_atomic_t daemond_sig_received;
-sig_atomic_t daemond_sig_int;
-sig_atomic_t daemond_sig_term;
+volatile sig_atomic_t daemond_sig_was_received;
+volatile sig_atomic_t daemond_sig_received[NSIG];
 */
 
 static void daemond_sig_handler(int sig) {
 	//debug("Signal %d received", sig);
-	daemond_sig_received = 1;
+	if (sig < NSIG) {
+		daemond_sig_was_received = 1;
+		daemond_sig_received[sig]++;
+	} else {
+		debug("Received signal %d (%s), ignoring", sig, sys_signame[sig]);
+	}
+	return;
+	/*
 	switch(sig) {
 		case SIGQUIT:
 		case SIGINT:
@@ -541,45 +592,67 @@ static void daemond_sig_handler(int sig) {
 			break;
 	}
 	exit(255);
+	*/
 }
+
+//#include <sys/ucontext.h>
 
 typedef struct {
 	int     signo;
 	char   *signame;
+	int     flags;
 	char   *name;
 	void  (*handler)(int);
+	//void  (*sihandler)(int, struct __siginfo *, ucontext_t *);
+	void  (*sihandler)(int, struct __siginfo *, void *);
 } daemond_sig_t;
 
 daemond_sig_t signals[] = {
-    { SIGTERM, "SIGTERM", "", daemond_sig_handler },
-    { SIGPIPE, "SIGPIPE, SIG_IGN", "", SIG_IGN },
-    { 0, NULL, "", NULL }
+	{ SIGINT,  "SIGINT",  0, "", daemond_sig_handler, 0 },
+	{ SIGTERM, "SIGTERM", 0, "", daemond_sig_handler, 0 },
+	{ SIGQUIT, "SIGQUIT", 0, "", daemond_sig_handler, 0 },
+	{ SIGCHLD, "SIGCHLD", 0, "", daemond_sig_handler, 0 },
+	{ SIGPIPE, "SIGPIPE, SIG_IGN", 0, "", SIG_IGN, 0 },
+	{ 0,       NULL,      0, "", NULL,             NULL }
 };
 
+void daemond_sig_set(daemond * d, daemond_sig_t * sig) {
+	struct sigaction   sa;
+	
+		bzero(&sa, sizeof(struct sigaction));
+		sa.sa_flags = sig->flags;
+		if ( sig->sihandler ) {
+			sa.sa_sigaction = sig->sihandler;
+			sa.sa_flags  |= SA_SIGINFO;
+		}
+		else
+		if( sig->handler ) {
+			sa.sa_handler = sig->handler;
+			sa.sa_flags  &= ~((unsigned int)SA_SIGINFO);
+		}
+		else {
+			sa.sa_handler = SIG_DFL;
+			sa.sa_flags  &= ~((unsigned int)SA_SIGINFO);
+		}
+		
+		sigemptyset(&sa.sa_mask);
+		if (sigaction(sig->signo, &sa, NULL) == -1) {
+			die("signal watcher sigaction(%s) failed: %s", sig->signame, ERR);
+		} else {
+			//debug("installed signal %s flags: %08x", sig->signame, sa.sa_flags);
+		}
+}
 
 void daemond_sig_init(daemond * d) {
-/*
-	if( signal(SIGINT,daemond_sig_handler) == -1 ){
-		die("signal watcher SIGINT failed: %s",ERR);
-	}
-	if( signal(SIGTERM,daemond_sig_handler) == -1 ){
-		die("signal watcher SIGTERM failed: %s",ERR);
-	}
-	if( signal(SIGCHLD,daemond_sig_handler) == -1 ){
-		die("signal watcher SIGCHLD failed: %s",ERR);
-	}
-*/
+	
+	daemond_sig_was_received = 0;
+	memset( (void *) daemond_sig_received,0,NSIG );
 	
 	daemond_sig_t     *sig;
 	struct sigaction   sa;
 	
 	for (sig = signals; sig->signo != 0; sig++) {
-		bzero(&sa, sizeof(struct sigaction));
-		sa.sa_handler = daemond_sig_handler;
-		sigemptyset(&sa.sa_mask);
-		if (sigaction(SIGINT, &sa, NULL) == -1) {
-			die("signal watcher sigaction(%s) failed: %s", sig->signame, ERR);
-		}
+		daemond_sig_set(d, sig);
 	}
 }
 
@@ -606,23 +679,57 @@ void daemond_daemonize(daemond * d) {
 			break;
 		default: // parent, controlling terminal
 			//daemond_say("")
-			daemond_say(d, "<y>waiting for %d to gone</>...", pid);
+			daemond_printf(d, "<y>waiting for %d to gone</>...", pid);
 			daemond_pid_forget(&d->pid);
 			t = htime();
 			while(1) {
 				gone = waitpid(pid, &status, WNOHANG);
 				//debug("gone = %d (%s)",gone, ERR);
 				if (gone > 0) {
+					colorprintf("<g>done</>\n");
 					break;
 				}
 				if (htime() - t > 10) {
-					daemond_say(d, "<r>tired of waiting");
-					break;
+					colorprintf("<r>tired of waiting</>\n");
+					exit(255);
 				}
 				usleep(100000);
 				fprintf(stdout,".");
 			}
-			//if (d->pid)
+			
+			if (d->use_pid) {
+				daemond_printf(d, "<y>Reading new pid</>...");
+				t = htime();
+				while (1) {
+					pid = daemond_pid_read(&d->pid);
+					if (gone == pid) {
+						if (!file_exists( d->pid.pidfile )) {
+							colorprintf( "<r>Pidfile disappeared. Possible daemon died. Look at logs</>\n" );
+							exit(255);
+						}
+						if (htime() - t > 10) {
+							colorprintf("<r>tired of waiting</>\n");
+							exit(255);
+						}
+						
+						fprintf(stdout,".");
+						usleep(100000);
+					} else {
+						colorprintf(" <g>%d</>\n", pid);
+						break;
+					}
+				}
+				daemond_printf(d, "<y>checking it's live</>...");
+				usleep(300000);
+				
+				if( kill(pid,0) == 0 ) {
+					colorprintf(" <g>looks ok</>\n");
+				} else {
+					colorprintf(" <r>no process with pid %d. Look at logs\n", pid);
+					exit(255);
+				}
+			}
+			
 			exit(0);
 	}
 	
@@ -639,7 +746,8 @@ void daemond_daemonize(daemond * d) {
 	}
 	
 	d->detached = 1;
-	daemond_pid_relock(&d->pid); // if?
+	if (d->use_pid)
+		daemond_pid_relock(&d->pid);
 	
 	//warn("i'm forked master process %d", getpid());
 	
@@ -748,15 +856,293 @@ void daemond_log_std_read(daemond * d) {
 }
 
 /*
- * Main init functions
+ * Main functions
  */
 
 void daemond_init(daemond * d) {
-	daemond_sig_received =
-	daemond_sig_int =
-	daemond_sig_term = 0;
+	
 	
 	bzero(d,sizeof(*d));
+	
+	d->use_pid          = 1;
+	d->children_count   = 1;
+	d->max_die          = 3;   // max die before raising restart interval
+	d->min_restart_interval =  // double seconds
+	d->restart_interval = 0.1; // double seconds
+	d->max_restart_interval = 30; // double seconds
+	
 	d->cli.d = d;
 	d->pid.d = d;
+}
+
+void daemond_sig_child_sihandler(int sig, struct __siginfo *info, void *uap) {
+	//debug("Signal %d received", sig);
+	debug("Received signal %d (%s), ignoring", sig, sys_signame[sig]);
+	return;
+}
+
+void daemond_sig_child_handler(int sig) {
+	//debug("Signal %d received", sig);
+	debug("Received signal %d (%s), ignoring", sig, sys_signame[sig]);
+	return;
+}
+
+
+int daemond_spawned(daemond * d) {
+
+/*
+	
+	daemond_sig_t child_signals[] = {
+		{ SIGINT,  "SIGINT",           0,            "", NULL, daemond_sig_child_sihandler },
+		{ SIGTERM, "SIGTERM",          0,            "", NULL, daemond_sig_child_sihandler },
+		{ SIGQUIT, "SIGQUIT",          0,            "", NULL, daemond_sig_child_sihandler },
+		{ SIGCHLD, "SIGCHLD",          SA_NOCLDSTOP, "", NULL, daemond_sig_child_sihandler },
+		{ SIGPIPE, "SIGPIPE, SIG_IGN", 0,            "", SIG_IGN, NULL },
+		{ 0,        NULL,              0,            "", NULL, NULL }
+	};
+	
+	daemond_sig_t child_signals[] = {
+		{ SIGINT,  "SIGINT",           0,            "", daemond_sig_child_handler, NULL },
+		{ SIGTERM, "SIGTERM",          0,            "", daemond_sig_child_handler, NULL },
+		{ SIGQUIT, "SIGQUIT",          0,            "", daemond_sig_child_handler, NULL },
+		{ SIGCHLD, "SIGCHLD",          SA_NOCLDSTOP, "", daemond_sig_child_handler, NULL },
+		{ SIGPIPE, "SIGPIPE, SIG_IGN", 0,            "", SIG_IGN, NULL },
+		{ 0,        NULL,              0,            "", NULL, NULL }
+	};
+*/
+	daemond_sig_t child_signals[] = {
+		{ SIGINT,  "SIGINT",           0,            "", SIG_IGN, NULL },
+		{ SIGTERM, "SIGTERM",          0,            "", SIG_DFL, NULL },
+		{ SIGQUIT, "SIGQUIT",          0,            "", SIG_DFL, NULL },
+		{ SIGCHLD, "SIGCHLD",          SA_NOCLDSTOP, "", SIG_DFL, NULL },
+		{ SIGPIPE, "SIGPIPE, SIG_IGN", 0,            "", SIG_IGN, NULL },
+		{ 0,        NULL,              0,            "", NULL, NULL }
+	};
+	
+	daemond_sig_t     *sig;
+	
+	for (sig = child_signals; sig->signo != 0; sig++) {
+		daemond_sig_set(d, sig);
+	}
+
+/*
+	{ SIGINT,  "SIGINT",  "", SIG_IGN },
+	{ SIGQUIT, "SIGQUIT", "", SIG_DFL },
+	{ SIGCHLD, "SIGCHLD", "", SIG_DFL },
+*/
+	//{ SIGPIPE, "SIGPIPE, SIG_IGN", "", SIG_IGN },
+}
+
+// should return 1 on master, 0 on child
+int daemond_fork(daemond * d, int slot) {
+	pid_t pid;
+	//char *argv[] = { "echo", "echo", "ok", 0 };
+	
+	switch (pid = fork()) {
+		case -1:
+			die("fork failed: %s", ERR);
+			return 1;
+		case 0:  // forked child
+			daemond_spawned(d);
+			return 0;
+		default: // master process
+			d->children[slot] = pid;
+			d->children_running++;
+			return 1;
+	}
+}
+
+// should return 1 on master, 0 on child
+int daemond_check_children(daemond * d) {
+	int i, do_fork = 0, running = 0;
+	pid_t pid;
+	for ( i=0; i < d->children_count; i++ ) {
+		if ( pid = d->children[i] ) {
+			if ( kill(pid,0) == 0 ) {
+				// ok
+				daemond_say(d,"<g>pid %d (slot %d) is alive",pid, i);
+				running++;
+			} else {
+				daemond_say(d,"<r>no more child for slot %d with pid %d (%s)",i,pid, ERR);
+				d->children[i] = 0;
+				do_fork = 1;
+			}
+		} else {
+			do_fork = 1;
+		}
+		if (do_fork) {
+			if (htime() > d->fork_at) {
+				if( !daemond_fork(d,i) ) {
+					return 0;
+				}
+			}
+		}
+	}
+	d->children_running = running;
+	return 1;
+}
+
+
+static void daemond_reaper(daemond * d) {
+	pid_t pid;
+	int status, exitcode, signal, core, died = 0;
+			while( ( pid = waitpid(-1,&status,WNOHANG) )  > 0) {
+				d->children_running--;
+				exitcode = status >> 8;
+				signal =  status & 127;
+				core = status & 128;
+				//debug("Reaping %d (status=%d, exit=%d, sig='%s', core=%d)", pid, status, exitcode, sys_signame[ signal ], core );
+				if (exitcode != 0) {
+					debug("Child %d died with exitcode %d (%s); signal=%s, core=%d", pid, exitcode, strerror(exitcode), sys_signame[ signal ], core );
+					died = 1;
+				} else
+				if (signal || core) {
+					if (signal == SIGTERM || signal == SIGQUIT || signal == SIGINT) {
+						debug("Child %d correctly exited with signal=%s, core=%d", pid, sys_signame[ signal ], core );
+					} else {
+						debug("Child %d died with signal=%s, core=%d", pid, sys_signame[ signal ], core );
+						died = 1;
+					}
+				}
+				else {
+					debug("Child %d normally gone",pid);
+					/*
+					if ( kill( pid, 0 ) == 0 ) {
+						debug("Pid is alive");
+					} else {
+						debug("Pid is dead: %s", ERR);
+					}
+					*/
+				}
+			}
+			if (died) {
+				d->die_count++;
+				d->last_die_count++;
+				if (d->max_die > 0 && ( d->last_die_count + 1 > d->max_die * d->children_count )) {
+					d->restart_interval *= 2;
+					if (d->restart_interval > d->max_restart_interval)
+						d->restart_interval = d->max_restart_interval;
+					debug( "Children repeatedly died %d times, restart interval=%0.2fs", d->die_count, d->restart_interval );
+					d->fork_at = htime() + ( d->restart_interval *= 2 );
+					d->last_die_count = 0;
+					//d->terminate = 1;
+				} else {
+					d->fork_at = htime() + d->restart_interval;
+				}
+			} else {
+				d->last_die_count = d->die_count = 0;
+				d->fork_at = htime();
+			}
+	
+}
+
+
+static void daemond_sig_safe_handler(daemond * d, int sig) {
+	switch(sig) {
+		case SIGQUIT:
+		case SIGINT:
+			debug("Handle sigint/sigquit");
+			d->terminate = 1;
+			return;
+		case SIGTERM:
+			debug("Handle sigterm");
+			d->terminate = 2;
+			return;
+		case SIGCHLD:
+			debug("Handle sigchld");
+			daemond_reaper(d);
+			return;
+		default:
+			debug("Signal %d received", sig);
+			break;
+	}
+	
+}
+
+void daemond_sig_check(daemond * d) {
+	pid_t pid;
+	int sig;
+		if(daemond_sig_was_received) {
+			for (sig=0; sig < NSIG; sig++) {
+				if (daemond_sig_received[sig]) {
+					daemond_sig_received[sig] = 0;
+					daemond_sig_safe_handler(d, sig);
+				}
+			}
+			daemond_sig_was_received = 0;
+		}
+	
+}
+
+void daemond_master(daemond * d) {
+	pid_t pid, children[ 10 ];
+	int i, sig;
+	
+	bzero( children, sizeof(children) );
+	d->children = children;
+	d->children_running = 0;
+	d->fork_at  = htime();
+	
+	daemond_sig_init(d);
+	
+	while(1) {
+		daemond_say(d,"xxx");
+		daemond_sig_check(d);
+		if (d->terminate)
+			break;
+		
+		/*
+			check_children will do forks. so if it's a master, it should leave within this loop.
+			otherwise it should go out
+			so, 0 is a child, 1 is a master
+		*/
+		
+		if ( ! daemond_check_children(d) ) {
+			return;
+		}
+		//usleep(100000);
+		usleep(1000000);
+	}
+	if (d->children_running) {
+		debug("Terminating %d children",d->children_running);
+		for ( i=0; i < d->children_count; i++ ) {
+			if ( pid = d->children[i] ) {
+				if(kill(pid, SIGTERM) == -1) {
+					debug("kill TERM %d failed: %s", pid,ERR);
+				} else {
+					debug("kill TERM %d successful", pid);
+				}
+			}
+		}
+		for (i=0;i<100;i++) {
+			daemond_sig_check(d);
+			if (d->children_running == 0)
+				break;
+			usleep( 50000 );
+		}
+		if (d->children_running) {
+			for ( i=0; i < d->children_count; i++ ) {
+				if ( pid = d->children[i] ) {
+					if(kill(pid, SIGKILL) == -1) {
+						debug("kill KILL %d failed: %s", pid,ERR);
+					} else {
+						debug("kill KILL %d successful", pid);
+					}
+				}
+			}
+		}
+	}
+	/*
+	for ( i=0; i < d->children_count; i++ ) {
+		if ( pid = d->children[i] ) {
+		}
+	}
+	*/
+	
+	daemond_say(d,"<y>terminating master");
+	exit(0);
+}
+
+void daemond_stop(daemond * d) {
+	
 }

@@ -26,11 +26,26 @@ struct _daemond {
 	int               force_quit;
 	int               detach;
 	int               detached;
+	
+	int               die_count;
+	int               last_die_count;
+	int               max_die;
+	double            fork_at;
+	double            min_restart_interval;
+	double            restart_interval;
+	double            max_restart_interval;
+	
 	daemond_pid       pid;
 	daemond_cli       cli;
 	
 	int               stdout_fd;
 	int               stderr_fd;
+	
+	int               children_count;
+	int               children_running;
+	pid_t           * children;
+	
+	int               terminate;
 };
 
 typedef struct _daemond daemond;
@@ -59,16 +74,19 @@ void  daemond_pid_close(daemond_pid * pid);
  */
 
 pid_t daemond_cli_kill(daemond_cli * cli, pid_t pid);
-void  daemond_cli_usage(daemond_cli * cli);
+void  daemond_cli_usage(daemond_cli * cli); // TODO
 void  daemond_cli_run(daemond_cli * cli, int argc, char *argv[]);
 
 /*
  * SIG functions
  */
 
-sig_atomic_t daemond_sig_received;
-sig_atomic_t daemond_sig_int;
-sig_atomic_t daemond_sig_term;
+#ifndef NSIG
+#define NSIG 128
+#endif
+
+volatile sig_atomic_t daemond_sig_was_received;
+volatile sig_atomic_t daemond_sig_received[NSIG];
 
 void daemond_sig_init(daemond * d);
 
@@ -90,4 +108,4 @@ void daemond_log_std_read(daemond * d);
  */
 
 void daemond_init(daemond * d);
-
+void daemond_master(daemond * d);
