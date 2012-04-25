@@ -1,0 +1,4 @@
+libdaemond
+==========
+
+Library for daemonization
